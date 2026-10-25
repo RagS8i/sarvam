@@ -16,15 +16,21 @@ import json
 import os
 import re
 import time
+import zipfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urljoin
+
+import requests
 
 __all__ = ["SUPPORTED_EXTENSIONS", "SarvamVisionError", "extract_document", "get_ocr_pipeline"]
 
 DEFAULT_OCR_MODEL = "sarvam-vision"
+DEFAULT_SARVAM_BASE_URL = "https://api.sarvam.ai"
 DEFAULT_OCR_TIMEOUT_S = 300.0
 DEFAULT_OCR_POLL_S = 2.0
+DEFAULT_OCR_REQUEST_TIMEOUT_S = 120.0
 MAX_PAGES_PER_JOB = 10
 MAX_VISION_BYTES = 200 * 1024 * 1024
 
@@ -351,7 +357,15 @@ def _page_blocks(page: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 class SarvamVisionPipeline:
-    """Sarvam Vision job runner with 10-page batching and safe polling."""
+    """Sarvam Vision job runner with 10-page batching and safe polling.
+
+    Uses the documented Document AI REST lifecycle directly:
+
+    ``POST /job/digitise`` → poll ``GET /job/{id}/status`` → mint a download
+    URL → download and parse the result ZIP.  The JSON output keeps individual
+    layout blocks, so CareFlow can preserve reading order and bounding boxes for
+    provenance.
+    """
 
     def __init__(
         self,
@@ -359,40 +373,71 @@ class SarvamVisionPipeline:
         timeout_s: float = DEFAULT_OCR_TIMEOUT_S,
         poll_s: float = DEFAULT_OCR_POLL_S,
         api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        language: Optional[str] = None,
+        content_type: Optional[str] = None,
+        request_timeout_s: float = DEFAULT_OCR_REQUEST_TIMEOUT_S,
     ):
         self.model = model
         self.timeout_s = timeout_s
         self.poll_s = max(0.2, poll_s)
+        self.request_timeout_s = max(1.0, request_timeout_s)
         self.api_key = api_key or os.getenv("SARVAM_API_KEY")
-        self._client = None
+        configured_base = (
+            base_url
+            or os.getenv("CAREFLOW_SARVAM_BASE_URL", DEFAULT_SARVAM_BASE_URL)
+        ).rstrip("/")
+        self.base_url = (
+            configured_base
+            if configured_base.endswith("/doc-ai/v1")
+            else f"{configured_base}/doc-ai/v1"
+        )
+        self.language = (
+            language
+            if language is not None
+            else os.getenv("CAREFLOW_OCR_LANGUAGE", "")
+        ).strip()
+        configured_content_type = (
+            content_type
+            if content_type is not None
+            else os.getenv("CAREFLOW_OCR_CONTENT_TYPE", "printed")
+        ).strip().lower()
+        self.content_type = (
+            configured_content_type
+            if configured_content_type in {"printed", "handwritten", "mixed"}
+            else "printed"
+        )
+        self._session = requests.Session()
 
-    def _get_client(self):
-        if self._client is not None:
-            return self._client
+    def _api_headers(self) -> dict[str, str]:
         if not self.api_key or not self.api_key.strip():
             raise SarvamVisionError(
                 "not_configured",
                 "SARVAM_API_KEY is not configured for document OCR.",
             )
-        try:
-            from sarvamai import SarvamAI
-        except ImportError as exc:
-            raise SarvamVisionError(
-                "dependency_missing", "The sarvamai package is not installed."
-            ) from exc
-        self._client = SarvamAI(api_subscription_key=self.api_key.strip())
-        return self._client
+        return {"api-subscription-key": self.api_key.strip()}
 
-    def _wait_for_job(self, client, job_id: str) -> None:
+    def _wait_for_job(self, job_id: str) -> None:
         deadline = time.monotonic() + self.timeout_s
+        status_url = f"{self.base_url}/job/{job_id}/status"
         while True:
             try:
-                status_response = client.doc_ai.get_status(job_id)
+                response = self._session.get(
+                    status_url,
+                    headers=self._api_headers(),
+                    timeout=min(30.0, self.request_timeout_s),
+                )
+                response.raise_for_status()
+                status_payload = response.json()
             except Exception as exc:
                 raise SarvamVisionError(
                     "status_failed", "Sarvam Vision status check failed."
                 ) from exc
-            status = str(getattr(status_response, "status", "") or "").strip().lower()
+            if not isinstance(status_payload, dict):
+                raise SarvamVisionError(
+                    "status_failed", "Sarvam Vision returned an invalid job status."
+                )
+            status = str(status_payload.get("status") or "").strip().lower()
             if status in _TERMINAL_SUCCESS:
                 return
             if status in _TERMINAL_FAILURE:
@@ -406,72 +451,69 @@ class SarvamVisionPipeline:
             time.sleep(self.poll_s)
 
     @staticmethod
-    def _result_payload(response: Any) -> dict[str, Any]:
-        if hasattr(response, "model_dump"):
-            payload = response.model_dump()
-        elif isinstance(response, dict):
-            payload = response
-        else:
-            payload = {}
-        if not isinstance(payload, dict):
+    def _archive_documents(content: bytes) -> list[dict[str, Any]]:
+        """Read document JSON payloads from the downloaded ZIP."""
+        if not content:
+            raise SarvamVisionError(
+                "empty_results", "Sarvam Vision returned no OCR output."
+            )
+        if len(content) > MAX_VISION_BYTES:
+            raise SarvamVisionError(
+                "too_large", "The OCR result exceeds CareFlow's size limit."
+            )
+
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(content))
+        except zipfile.BadZipFile:
+            # Be tolerant of a JSON body from a future API revision.
+            try:
+                direct = json.loads(content.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise SarvamVisionError(
+                    "malformed_results", "Sarvam Vision returned an invalid result."
+                ) from exc
+            return [direct] if isinstance(direct, dict) else []
+
+        documents: list[dict[str, Any]] = []
+        total_uncompressed = 0
+        try:
+            with archive:
+                for info in archive.infolist():
+                    total_uncompressed += max(0, info.file_size)
+                    if total_uncompressed > MAX_VISION_BYTES:
+                        raise SarvamVisionError(
+                            "too_large",
+                            "The OCR result exceeds CareFlow's size limit.",
+                        )
+                    name = info.filename
+                    lower_name = name.lower()
+                    parts = {part.lower() for part in name.split("/")}
+                    if lower_name.endswith("manifest.json"):
+                        continue
+                    if "metadata" in parts:
+                        continue
+                    if not lower_name.endswith(".json"):
+                        continue
+                    try:
+                        payload = json.loads(archive.read(info).decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if isinstance(payload, dict):
+                        documents.append(payload)
+        except SarvamVisionError:
+            raise
+        except Exception as exc:
             raise SarvamVisionError(
                 "malformed_results", "Sarvam Vision returned an invalid result."
-            )
-        return payload
+            ) from exc
+        return documents
 
-    def _run_batch(
-        self,
-        files: list[tuple[str, bytes, str]],
-        *,
-        page_offset: int,
+    def _parse_archive(
+        self, content: bytes, *, page_offset: int
     ) -> list[dict[str, Any]]:
-        total_bytes = sum(len(content) for _name, content, _mime in files)
-        if total_bytes > MAX_VISION_BYTES:
-            raise SarvamVisionError(
-                "too_large", "The document exceeds Sarvam Vision's 200 MB limit."
-            )
-
-        client = self._get_client()
-        kwargs: dict[str, Any] = {
-            "file": files,
-            "content_type": "mixed",
-        }
-        # The public model name ``sarvam-vision`` is not accepted by the
-        # Document AI digitise pipeline's model override.  Omitting ``model``
-        # lets Sarvam select the pipeline's current default.  An explicit,
-        # non-default override is still forwarded for future pipeline models.
-        model = (self.model or "").strip()
-        if model and model.lower() not in {"auto", "default", "sarvam-vision"}:
-            kwargs["model"] = model
-        try:
-            started = client.doc_ai.digitise(**kwargs)
-        except Exception as exc:
-            raise SarvamVisionError(
-                "start_failed", "Sarvam Vision could not start the OCR job."
-            ) from exc
-
-        job_id = getattr(started, "job_id", None)
-        if not job_id:
-            raise SarvamVisionError(
-                "start_failed", "Sarvam Vision did not return a job identifier."
-            )
-        self._wait_for_job(client, job_id)
-
-        try:
-            results = client.doc_ai.get_results(job_id, format="json")
-        except Exception as exc:
-            raise SarvamVisionError(
-                "results_failed", "Sarvam Vision results could not be retrieved."
-            ) from exc
-
-        payload = self._result_payload(results)
-        documents = payload.get("documents")
-        if not isinstance(documents, list):
-            documents = []
+        documents = self._archive_documents(content)
         raw_pages: list[dict[str, Any]] = []
         for document in documents:
-            if not isinstance(document, dict):
-                continue
             document_pages = document.get("pages")
             if not isinstance(document_pages, list):
                 continue
@@ -496,6 +538,106 @@ class SarvamVisionPipeline:
                 "empty_results", "Sarvam Vision returned no readable pages."
             )
         return pages
+
+    def _download_output(self, job_id: str) -> bytes:
+        link_url = f"{self.base_url}/job/{job_id}/download-url"
+        try:
+            link_response = self._session.get(
+                link_url,
+                headers=self._api_headers(),
+                timeout=min(30.0, self.request_timeout_s),
+            )
+            link_response.raise_for_status()
+            link_payload = link_response.json()
+        except Exception as exc:
+            raise SarvamVisionError(
+                "results_failed", "Sarvam Vision results could not be retrieved."
+            ) from exc
+        if not isinstance(link_payload, dict):
+            raise SarvamVisionError(
+                "results_failed", "Sarvam Vision returned an invalid download link."
+            )
+
+        download_url = str(link_payload.get("url") or "").strip()
+        if not download_url.startswith(("https://", "http://")):
+            raise SarvamVisionError(
+                "results_failed", "Sarvam Vision returned an invalid download link."
+            )
+        download_url = urljoin("https://api.sarvam.ai/", download_url)
+        download_headers = link_payload.get("headers") or {}
+        if not isinstance(download_headers, dict):
+            download_headers = {}
+        try:
+            output = self._session.get(
+                download_url,
+                headers={str(k): str(v) for k, v in download_headers.items()},
+                timeout=max(300.0, self.request_timeout_s),
+            )
+            output.raise_for_status()
+        except Exception as exc:
+            raise SarvamVisionError(
+                "results_failed", "Sarvam Vision results could not be downloaded."
+            ) from exc
+        return output.content
+
+    def _run_batch(
+        self,
+        files: list[tuple[str, bytes, str]],
+        *,
+        page_offset: int,
+    ) -> list[dict[str, Any]]:
+        total_bytes = sum(len(content) for _name, content, _mime in files)
+        if total_bytes > MAX_VISION_BYTES:
+            raise SarvamVisionError(
+                "too_large", "The document exceeds Sarvam Vision's 200 MB limit."
+            )
+
+        data: dict[str, str] = {
+            "output_format": "json",
+            "content_type": self.content_type,
+            "auto_orient": "true",
+        }
+        if self.language:
+            data["language"] = self.language
+        # The public model name ``sarvam-vision`` is not accepted by the
+        # digitise pipeline's model override.  Omitting ``model`` lets Sarvam
+        # select the pipeline's current default.  An explicit, non-default
+        # override is still forwarded for future pipeline models.
+        model = (self.model or "").strip()
+        if model and model.lower() not in {"auto", "default", "sarvam-vision"}:
+            data["model"] = model
+
+        upload_files = [
+            ("file", (name, content, mime)) for name, content, mime in files
+        ]
+        try:
+            started = self._session.post(
+                f"{self.base_url}/job/digitise",
+                headers=self._api_headers(),
+                files=upload_files,
+                data=data,
+                timeout=self.request_timeout_s,
+            )
+            started.raise_for_status()
+            started_payload = started.json()
+        except Exception as exc:
+            raise SarvamVisionError(
+                "start_failed", "Sarvam Vision could not start the OCR job."
+            ) from exc
+
+        job_id = (
+            started_payload.get("job_id")
+            if isinstance(started_payload, dict)
+            else None
+        )
+        if not job_id:
+            raise SarvamVisionError(
+                "start_failed", "Sarvam Vision did not return a job identifier."
+            )
+        self._wait_for_job(str(job_id))
+
+        content = self._download_output(str(job_id))
+        return self._parse_archive(content, page_offset=page_offset)
 
     def _render_pdf_batch(self, path: Path, start: int, count: int) -> list[tuple[str, bytes, str]]:
         try:
@@ -594,6 +736,12 @@ def get_ocr_pipeline() -> SarvamVisionPipeline:
         model=model or DEFAULT_OCR_MODEL,
         timeout_s=_env_float("CAREFLOW_OCR_TIMEOUT_S", DEFAULT_OCR_TIMEOUT_S),
         poll_s=_env_float("CAREFLOW_OCR_POLL_S", DEFAULT_OCR_POLL_S),
+        base_url=os.getenv("CAREFLOW_SARVAM_BASE_URL", DEFAULT_SARVAM_BASE_URL),
+        language=os.getenv("CAREFLOW_OCR_LANGUAGE", ""),
+        content_type=os.getenv("CAREFLOW_OCR_CONTENT_TYPE", "printed"),
+        request_timeout_s=_env_float(
+            "CAREFLOW_OCR_REQUEST_TIMEOUT_S", DEFAULT_OCR_REQUEST_TIMEOUT_S
+        ),
     )
 
 

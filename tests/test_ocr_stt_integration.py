@@ -1,8 +1,9 @@
 """Integration tests for OCR1 and STT_translation modules with CareFlow adapters."""
 from __future__ import annotations
 
+import io
 import json
-from types import SimpleNamespace
+import zipfile
 
 import pytest
 from fastapi.testclient import TestClient
@@ -26,62 +27,100 @@ from STT_translation.schemas import (
 from STT_translation.api import app as stt_app
 
 
-def test_vision_digitise_uses_pipeline_default_and_parses_blocks():
-    """The digitise pipeline rejects the public ``sarvam-vision`` alias."""
-    captured = {}
+class _FakeResponse:
+    def __init__(self, payload=None, *, content: bytes = b"", status_code: int = 200):
+        self._payload = payload
+        self.content = content
+        self.status_code = status_code
 
-    class FakeDocAI:
-        def digitise(self, **kwargs):
-            captured["start"] = kwargs
-            return SimpleNamespace(job_id="job_check")
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
 
-        def get_status(self, job_id):
-            assert job_id == "job_check"
-            return SimpleNamespace(status="partially_completed")
+    def json(self):
+        return self._payload
 
-        def get_results(self, job_id, **kwargs):
-            captured["results"] = kwargs
-            return SimpleNamespace(
-                model_dump=lambda: {
-                    "documents": [
-                        {
-                            "pages": [
-                                {
-                                    "blocks": [
-                                        {
-                                            "layout_tag": "paragraph",
-                                            "text": "Second line",
-                                            "reading_order": 2,
-                                            "coordinates": {
-                                                "x1": 10,
-                                                "y1": 20,
-                                                "x2": 100,
-                                                "y2": 50,
-                                            },
-                                        },
-                                        {
-                                            "layout_tag": "heading",
-                                            "text": "First line",
-                                            "reading_order": 1,
-                                        },
-                                    ]
-                                }
-                            ]
-                        }
-                    ]
+
+def _vision_zip(payload: dict) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("document/document.json", json.dumps(payload))
+        archive.writestr("manifest.json", json.dumps({"status": "completed"}))
+    return buffer.getvalue()
+
+
+class _FakeSession:
+    def __init__(self, archive: bytes):
+        self.archive = archive
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append(("POST", url, kwargs))
+        return _FakeResponse({"job_id": "job_check"}, status_code=201)
+
+    def get(self, url, **kwargs):
+        self.calls.append(("GET", url, kwargs))
+        if url.endswith("/job/job_check/status"):
+            return _FakeResponse({"status": "partially_completed"})
+        if url.endswith("/job/job_check/download-url"):
+            return _FakeResponse(
+                {
+                    "url": "https://download.example/result.zip",
+                    "headers": {"X-Test": "1"},
                 }
             )
+        if url.startswith("https://download.example/"):
+            return _FakeResponse(content=self.archive)
+        raise AssertionError(f"unexpected request: {url}")
 
+
+def test_vision_digitise_uses_pipeline_default_and_parses_blocks():
+    """The pipeline uses the documented REST flow and omits the invalid alias."""
+    archive_payload = {
+        "pages": [
+            {
+                "blocks": [
+                    {
+                        "layout_tag": "paragraph",
+                        "text": "Second line",
+                        "reading_order": 2,
+                        "coordinates": {
+                            "x1": 10,
+                            "y1": 20,
+                            "x2": 100,
+                            "y2": 50,
+                        },
+                    },
+                    {
+                        "layout_tag": "heading",
+                        "text": "First line",
+                        "reading_order": 1,
+                    },
+                ]
+            }
+        ]
+    }
+    fake = _FakeSession(_vision_zip(archive_payload))
     pipeline = SarvamVisionPipeline(model="sarvam-vision", api_key="test-key")
-    pipeline._get_client = lambda: SimpleNamespace(doc_ai=FakeDocAI())
+    pipeline._session = fake
 
     pages = pipeline._run_batch(
         [("page.png", b"image", "image/png")], page_offset=0
     )
 
-    assert "model" not in captured["start"]
-    assert captured["start"]["content_type"] == "mixed"
-    assert captured["results"]["format"] == "json"
+    post = next(call for call in fake.calls if call[0] == "POST")
+    assert post[1].endswith("/job/digitise")
+    assert post[2]["data"]["output_format"] == "json"
+    assert post[2]["data"]["content_type"] == "printed"
+    assert "model" not in post[2]["data"]
+    assert post[2]["files"] == [
+        ("file", ("page.png", b"image", "image/png"))
+    ]
+
+    download = next(
+        call for call in fake.calls if call[1].startswith("https://download.example/")
+    )
+    assert download[2]["headers"] == {"X-Test": "1"}
     assert pages == [
         {
             "page_number": 1,
@@ -98,39 +137,19 @@ def test_vision_digitise_uses_pipeline_default_and_parses_blocks():
 
 
 def test_vision_digitise_forwards_explicit_model_override():
-    captured = {}
-
-    class FakeDocAI:
-        def digitise(self, **kwargs):
-            captured.update(kwargs)
-            return SimpleNamespace(job_id="job_check")
-
-        def get_status(self, job_id):
-            return SimpleNamespace(status="completed")
-
-        def get_results(self, job_id, **kwargs):
-            return SimpleNamespace(
-                model_dump=lambda: {
-                    "documents": [
-                        {
-                            "pages": [
-                                {
-                                    "content": "<p>Readable text</p>",
-                                }
-                            ]
-                        }
-                    ]
-                }
-            )
-
+    archive_payload = {
+        "pages": [{"content": "<p>Readable text</p>"}],
+    }
+    fake = _FakeSession(_vision_zip(archive_payload))
     pipeline = SarvamVisionPipeline(model="future-vision", api_key="test-key")
-    pipeline._get_client = lambda: SimpleNamespace(doc_ai=FakeDocAI())
+    pipeline._session = fake
 
     pages = pipeline._run_batch(
         [("page.png", b"image", "image/png")], page_offset=4
     )
 
-    assert captured["model"] == "future-vision"
+    post = next(call for call in fake.calls if call[0] == "POST")
+    assert post[2]["data"]["model"] == "future-vision"
     assert pages == [
         {
             "page_number": 5,
