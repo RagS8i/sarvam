@@ -149,7 +149,7 @@ A GitHub Actions workflow (`.github/workflows/pages.yml`) publishes the static c
 The deployed demo URL is:
 
 ```text
-https://rags8i.github.io/confluentia-web/
+https://rags8i.github.io/sarvam/
 ```
 
 Enter the backend URL in the web app before using clinical features. GitHub Pages only hosts the static client; it does not run the FastAPI backend or hold any patient data.
