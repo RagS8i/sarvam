@@ -73,6 +73,10 @@ def _fact_phrase(fact: Fact) -> Optional[str]:
     status = fact.status
     if fact.fact_type == FactType.medication:
         dose = _measurement(fact)
+        if dose.lower() == label.lower():
+            dose = ""
+        elif dose.lower().startswith(label.lower()):
+            dose = dose[len(label) :].strip(" ,;-")
         medicine = f"{label} {dose}".strip()
         if status == FactStatus.present:
             return f"You reported taking {medicine}."

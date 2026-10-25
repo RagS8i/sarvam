@@ -95,6 +95,8 @@ def test_patient_detail_hides_clinician_only_content(client):
     assert "Your CareFlow care summary" in body["text"]
     assert "What happens next" in body["text"]
     assert "draft clinician" not in body["text"].lower()
+    assert "metformin metformin" not in body["text"].lower()
+    assert "You reported taking metformin." in body["text"]
 
 
 def test_patient_context_card_translates_and_speaks(
