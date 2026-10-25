@@ -130,6 +130,16 @@ Put it behind HTTPS (reverse proxy, tunnel, or platform ingress) and expose it t
 
 The repository includes `vercel.json` and the static client in `app/static`.
 
+The current demo deployment is:
+
+```text
+https://static-theta-self.vercel.app/
+```
+
+It was published as a temporary Vercel deployment. Claim it from the Vercel dashboard while signed in if you want to keep it permanently and enable Git-based deployments.
+
+To publish a new deployment from a machine with Vercel credentials:
+
 ```bash
 npx vercel app/static --yes --prod
 ```
