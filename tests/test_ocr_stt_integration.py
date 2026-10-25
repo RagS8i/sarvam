@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,6 +14,7 @@ from app.pipeline.normalize import (
     adapt_stt,
     sources_from_ocr_pipeline,
 )
+from OCR1.model import SarvamVisionPipeline
 from OCR1.organizer import _merge_organized_sources
 from STT_translation.schemas import (
     Language,
@@ -22,6 +24,119 @@ from STT_translation.schemas import (
     TranscriptChunk,
 )
 from STT_translation.api import app as stt_app
+
+
+def test_vision_digitise_uses_pipeline_default_and_parses_blocks():
+    """The digitise pipeline rejects the public ``sarvam-vision`` alias."""
+    captured = {}
+
+    class FakeDocAI:
+        def digitise(self, **kwargs):
+            captured["start"] = kwargs
+            return SimpleNamespace(job_id="job_check")
+
+        def get_status(self, job_id):
+            assert job_id == "job_check"
+            return SimpleNamespace(status="partially_completed")
+
+        def get_results(self, job_id, **kwargs):
+            captured["results"] = kwargs
+            return SimpleNamespace(
+                model_dump=lambda: {
+                    "documents": [
+                        {
+                            "pages": [
+                                {
+                                    "blocks": [
+                                        {
+                                            "layout_tag": "paragraph",
+                                            "text": "Second line",
+                                            "reading_order": 2,
+                                            "coordinates": {
+                                                "x1": 10,
+                                                "y1": 20,
+                                                "x2": 100,
+                                                "y2": 50,
+                                            },
+                                        },
+                                        {
+                                            "layout_tag": "heading",
+                                            "text": "First line",
+                                            "reading_order": 1,
+                                        },
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            )
+
+    pipeline = SarvamVisionPipeline(model="sarvam-vision", api_key="test-key")
+    pipeline._get_client = lambda: SimpleNamespace(doc_ai=FakeDocAI())
+
+    pages = pipeline._run_batch(
+        [("page.png", b"image", "image/png")], page_offset=0
+    )
+
+    assert "model" not in captured["start"]
+    assert captured["start"]["content_type"] == "mixed"
+    assert captured["results"]["format"] == "json"
+    assert pages == [
+        {
+            "page_number": 1,
+            "blocks": [
+                {"label": "heading", "text": "First line"},
+                {
+                    "label": "paragraph",
+                    "text": "Second line",
+                    "bbox": [10.0, 20.0, 100.0, 50.0],
+                },
+            ],
+        }
+    ]
+
+
+def test_vision_digitise_forwards_explicit_model_override():
+    captured = {}
+
+    class FakeDocAI:
+        def digitise(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(job_id="job_check")
+
+        def get_status(self, job_id):
+            return SimpleNamespace(status="completed")
+
+        def get_results(self, job_id, **kwargs):
+            return SimpleNamespace(
+                model_dump=lambda: {
+                    "documents": [
+                        {
+                            "pages": [
+                                {
+                                    "content": "<p>Readable text</p>",
+                                }
+                            ]
+                        }
+                    ]
+                }
+            )
+
+    pipeline = SarvamVisionPipeline(model="future-vision", api_key="test-key")
+    pipeline._get_client = lambda: SimpleNamespace(doc_ai=FakeDocAI())
+
+    pages = pipeline._run_batch(
+        [("page.png", b"image", "image/png")], page_offset=4
+    )
+
+    assert captured["model"] == "future-vision"
+    assert pages == [
+        {
+            "page_number": 5,
+            "blocks": [{"label": "text", "text": "Readable text"}],
+        }
+    ]
 
 
 def test_stt_translation_schemas():

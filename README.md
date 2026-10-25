@@ -188,7 +188,7 @@ Tests use the deterministic `mock` provider; no live Sarvam key is required. Liv
 | `CAREFLOW_LLM_PROVIDER` | `sarvam` (default), `ollama` (legacy local), or `mock` (tests only). |
 | `CAREFLOW_SARVAM_CHAT_MODEL` | Chat model, default `glm5.3`. |
 | `CAREFLOW_SARVAM_BASE_URL` | Default `https://api.sarvam.ai`. |
-| `CAREFLOW_OCR_MODEL` | Default `sarvam-vision`. |
+| `CAREFLOW_OCR_MODEL` | Optional digitise model override. Leave blank to use Sarvam's pipeline default. |
 | `CAREFLOW_TTS_MODEL` | Default `bulbul:v3`. |
 | `CAREFLOW_TTS_SPEAKER` | Default `shubh`. |
 | `CAREFLOW_PATIENT_VOICE_MAX_CHARS` | Maximum context-card characters sent to translation/voice. |

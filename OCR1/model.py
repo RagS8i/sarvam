@@ -42,7 +42,15 @@ SUPPORTED_EXTENSIONS = frozenset(
 )
 
 _TERMINAL_FAILURE = {"failed", "error", "cancelled", "canceled", "rejected"}
-_TERMINAL_SUCCESS = {"completed", "complete", "succeeded", "success", "done", "processed"}
+_TERMINAL_SUCCESS = {
+    "completed",
+    "complete",
+    "partially_completed",
+    "succeeded",
+    "success",
+    "done",
+    "processed",
+}
 
 
 class SarvamVisionError(RuntimeError):
@@ -140,6 +148,8 @@ def _normalize_bbox(value: Any) -> Optional[list[float]]:
         try:
             if {"x0", "y0", "x1", "y1"} <= set(value):
                 return [float(value["x0"]), float(value["y0"]), float(value["x1"]), float(value["y1"])]
+            if {"x1", "y1", "x2", "y2"} <= set(value):
+                return [float(value["x1"]), float(value["y1"]), float(value["x2"]), float(value["y2"])]
             if {"x", "y", "width", "height"} <= set(value):
                 x, y = float(value["x"]), float(value["y"])
                 return [x, y, x + float(value["width"]), y + float(value["height"])]
@@ -173,6 +183,7 @@ def _normalize_block(
 
     label = str(
         value.get("label")
+        or value.get("layout_tag")
         or value.get("type")
         or value.get("tag")
         or value.get("block_label")
@@ -302,6 +313,43 @@ def _page_payload(payload: Any) -> tuple[str, list[dict[str, Any]]]:
     return text, deduped
 
 
+def _page_blocks(page: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize the block list returned by Document AI digitise results.
+
+    The JSON result normally nests text under ``page["blocks"]``.  Older
+    responses and HTML/markdown results instead expose a ``content`` string, so
+    both shapes are supported.
+    """
+    raw_blocks = page.get("blocks")
+    if isinstance(raw_blocks, list) and raw_blocks:
+        ordered = [block for block in raw_blocks if isinstance(block, dict)]
+        ordered.sort(
+            key=lambda block: (
+                not isinstance(block.get("reading_order"), (int, float)),
+                block.get("reading_order")
+                if isinstance(block.get("reading_order"), (int, float))
+                else 0,
+            )
+        )
+        blocks: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for raw_block in ordered:
+            block = _normalize_block(raw_block)
+            if block is None:
+                continue
+            key = (block["label"], block["text"])
+            if key in seen:
+                continue
+            seen.add(key)
+            blocks.append(block)
+        if blocks:
+            return blocks
+
+    content = page.get("content") or page.get("text") or page.get("markdown")
+    _text, blocks = _page_payload(content)
+    return blocks
+
+
 class SarvamVisionPipeline:
     """Sarvam Vision job runner with 10-page batching and safe polling."""
 
@@ -384,12 +432,19 @@ class SarvamVisionPipeline:
             )
 
         client = self._get_client()
+        kwargs: dict[str, Any] = {
+            "file": files,
+            "content_type": "mixed",
+        }
+        # The public model name ``sarvam-vision`` is not accepted by the
+        # Document AI digitise pipeline's model override.  Omitting ``model``
+        # lets Sarvam select the pipeline's current default.  An explicit,
+        # non-default override is still forwarded for future pipeline models.
+        model = (self.model or "").strip()
+        if model and model.lower() not in {"auto", "default", "sarvam-vision"}:
+            kwargs["model"] = model
         try:
-            started = client.doc_ai.digitise(
-                file=files,
-                content_type="mixed",
-                model=self.model,
-            )
+            started = client.doc_ai.digitise(**kwargs)
         except Exception as exc:
             raise SarvamVisionError(
                 "start_failed", "Sarvam Vision could not start the OCR job."
@@ -413,26 +468,28 @@ class SarvamVisionPipeline:
         documents = payload.get("documents")
         if not isinstance(documents, list):
             documents = []
-        pages: list[dict[str, Any]] = []
+        raw_pages: list[dict[str, Any]] = []
         for document in documents:
             if not isinstance(document, dict):
                 continue
-            raw_pages = document.get("pages")
-            if not isinstance(raw_pages, list):
+            document_pages = document.get("pages")
+            if not isinstance(document_pages, list):
                 continue
-            for raw_page in raw_pages:
-                if not isinstance(raw_page, dict):
-                    continue
-                content = raw_page.get("content")
-                if content is None:
-                    content = raw_page.get("text") or raw_page.get("markdown")
-                _text, blocks = _page_payload(content)
-                pages.append(
-                    {
-                        "page_number": page_offset + len(pages) + 1,
-                        "blocks": blocks,
-                    }
-                )
+            raw_pages.extend(
+                page for page in document_pages if isinstance(page, dict)
+            )
+
+        pages: list[dict[str, Any]] = []
+        for raw_page in raw_pages:
+            page_blocks = _page_blocks(raw_page)
+            if not page_blocks:
+                continue
+            pages.append(
+                {
+                    "page_number": page_offset + len(pages) + 1,
+                    "blocks": page_blocks,
+                }
+            )
 
         if not pages:
             raise SarvamVisionError(
